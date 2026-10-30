@@ -1,0 +1,1671 @@
+<!DOCTYPE html>
+<html lang="id">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+    <title>Gageh Surian - Ojek Online Nagari</title>
+    
+    <!-- Google Fonts: Poppins untuk desain profesional dan modern -->
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=Poppins:wght@300;400;500;600;700;800&display=swap" rel="stylesheet">
+    
+    <!-- FontAwesome untuk Icon UI -->
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
+    
+    <!-- Firebase SDK v8 (Sangat optimal untuk aplikasi Single-File tanpa bundler) -->
+    <script src="https://www.gstatic.com/firebasejs/8.10.1/firebase-app.js"></script>
+    <script src="https://www.gstatic.com/firebasejs/8.10.1/firebase-database.js"></script>
+
+    <!-- ======================================================================= -->
+    <!-- SEGMEN 1: KONFIGURASI FIREBASE, STATE GLOBAL, & FUNGSI UTILITAS DASAR -->
+    <!-- ======================================================================= -->
+    <script>
+        /**
+         * 1. KONFIGURASI FIREBASE
+         * Menggunakan Firebase dari arsitektur Gageh Surian.
+         */
+        const firebaseConfig = {
+            apiKey: "AIzaSyAzf3uuf825HpS9aV79jemB-UhEs4MqwvA",
+            authDomain: "gageh--jek.firebaseapp.com",
+            projectId: "gageh--jek",
+            storageBucket: "gageh--jek.firebasestorage.app",
+            messagingSenderId: "1063365331975",
+            appId: "1:1063365331975:web:48d28f50091c1e7a18eea2",
+            measurementId: "G-MYDBSJFCSV"
+        };
+
+        // Inisialisasi Firebase App secara aman
+        if (!firebase.apps.length) {
+            firebase.initializeApp(firebaseConfig);
+        }
+        const db = firebase.database();
+
+        /**
+         * 2. STATE GLOBAL APLIKASI
+         * Menyimpan status, peran, dan sesi agar tidak logout saat di-refresh.
+         */
+        let currentUser = null; // Menyimpan data akun driver/penumpang yang login
+        let userRole = ''; // 'driver' atau 'passenger'
+        
+        // Data Lokasi GPS Real-time (Sangat krusial untuk server pertemuan)
+        let currentLocation = {
+            lat: null,
+            lng: null,
+            kecamatan: null
+        };
+
+        // Memantau transaksi order yang sedang berjalan
+        let activeOrderId = null;
+        let activeOrderData = null;
+
+        /**
+         * 3. FUNGSI UTILITAS: GENERATOR ID (HURUF KAPITAL & ANGKA)
+         */
+        
+        // ID Driver (6 Digit Acak)
+        function generateDriverID() {
+            const chars = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789';
+            let result = '';
+            for (let i = 0; i < 6; i++) {
+                result += chars.charAt(Math.floor(Math.random() * chars.length));
+            }
+            return result;
+        }
+
+        // ID Transaksi (16 Digit Acak)
+        function generateTransactionID() {
+            const chars = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789';
+            let result = '';
+            for (let i = 0; i < 16; i++) {
+                result += chars.charAt(Math.floor(Math.random() * chars.length));
+            }
+            return result;
+        }
+
+        /**
+         * 4. FUNGSI UTILITAS: FORMAT RUPIAH & INPUT RIBUAN
+         */
+        
+        // Format teks nominal dengan awalan Rp dan titik ribuan
+        function formatRupiah(angka) {
+            if (angka === null || angka === undefined) return 'Rp 0';
+            let numberString = angka.toString().replace(/[^,\d]/g, '');
+            let split = numberString.split(',');
+            let sisa = split[0].length % 3;
+            let rupiah = split[0].substr(0, sisa);
+            let ribuan = split[0].substr(sisa).match(/\d{3}/gi);
+
+            if (ribuan) {
+                let separator = sisa ? '.' : '';
+                rupiah += separator + ribuan.join('.');
+            }
+            return 'Rp ' + rupiah;
+        }
+
+        // Auto-format field input saat mengetik ongkos/top up (Titik otomatis)
+        function formatInputRibuan(inputElement) {
+            let val = inputElement.value.replace(/[^,\d]/g, '');
+            if (val) {
+                inputElement.value = parseInt(val, 10).toLocaleString('id-ID');
+            } else {
+                inputElement.value = '';
+            }
+        }
+
+        /**
+         * 5. FUNGSI UTILITAS: SENSOR PRIVASI CHAT
+         */
+        
+        // Deteksi dan sensor pengiriman nomor HP / WA di obrolan
+        function censorPrivateInfo(text) {
+            if (!text) return '';
+            // Mencari pola angka yang mirip format No HP (+62, 62, 08 dst) dengan panjang 10-14 digit
+            const phoneRegex = /(?:\+62|62|0)[2-9]\d{7,11}/g;
+            return text.replace(phoneRegex, "[Nomor HP/WA Disembunyikan]");
+        }
+
+        /**
+         * 6. FUNGSI UTILITAS: ALGORITMA JARAK GPS (HAVERSINE)
+         * Menghitung jarak lurus (meter) antara dua titik koordinat GPS
+         */
+        function calculateDistance(lat1, lon1, lat2, lon2) {
+            const R = 6371e3; // Radius Bumi dalam satuan meter
+            const phi1 = lat1 * Math.PI / 180;
+            const phi2 = lat2 * Math.PI / 180;
+            const deltaPhi = (lat2 - lat1) * Math.PI / 180;
+            const deltaLambda = (lon2 - lon1) * Math.PI / 180;
+
+            const a = Math.sin(deltaPhi / 2) * Math.sin(deltaPhi / 2) +
+                      Math.cos(phi1) * Math.cos(phi2) *
+                      Math.sin(deltaLambda / 2) * Math.sin(deltaLambda / 2);
+            
+            const c = 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
+            return R * c; // Kembalikan jarak dalam meter
+        }
+    </script>
+    <style>
+        /* ======================================================================= */
+        /* SEGMEN 2: CSS TERINTEGRASI, ANIMASI, & UI FRAMEWORK PROFESSIONAL          */
+        /* ======================================================================= */
+        :root {
+            --primary: #1E3A8A;       /* Biru Korporat Utama */
+            --secondary: #2563EB;     /* Biru Dinamis */
+            --accent: #F59E0B;        /* Oranye Emas Aksi */
+            --background: #F3F4F6;    /* Abu-abu Lembut */
+            --card-bg: #FFFFFF;       /* Putih Bersih */
+            --text-dark: #1F2937;     /* Teks Utama Gelap */
+            --text-light: #6B7280;    /* Teks Sekunder Terang */
+            --success: #10B981;       /* Hijau Indikator Sukses */
+            --danger: #EF4444;        /* Merah Peringatan */
+            --border: #E5E7EB;        /* Garis Batas Lembut */
+        }
+
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+            font-family: 'Poppins', sans-serif;
+            -webkit-tap-highlight-color: transparent;
+        }
+
+        body {
+            background-color: var(--background);
+            color: var(--text-dark);
+            height: 100vh;
+            overflow-x: hidden;
+            position: relative;
+        }
+
+        /* Container Mobile App Frame (Maksimal 480px agar rapi di HP maupun Web) */
+        .app-container {
+            max-width: 480px;
+            margin: 0 auto;
+            background: var(--card-bg);
+            height: 100vh;
+            position: relative;
+            box-shadow: 0 0 30px rgba(0, 0, 0, 0.08);
+            display: flex;
+            flex-direction: column;
+            overflow-y: auto;
+        }
+
+        /* Animasi Transisi Halaman Mulus */
+        .page {
+            display: none;
+            padding: 20px;
+            animation: fadeInPage 0.35s ease-in-out;
+            flex-grow: 1;
+        }
+        .page.active {
+            display: block;
+        }
+        @keyframes fadeInPage {
+            from { opacity: 0; transform: translateY(8px); }
+            to { opacity: 1; transform: translateY(0); }
+        }
+
+        /* Tipografi & Spasi */
+        h1, h2, h3, h4 { color: var(--primary); font-weight: 700; }
+        .text-center { text-align: center; }
+        .mt-4 { margin-top: 1rem; }
+        .mb-4 { margin-bottom: 1rem; }
+        .hidden { display: none !important; }
+
+        /* Komponen Tombol Profesional */
+        .btn {
+            width: 100%;
+            padding: 14px 20px;
+            border: none;
+            border-radius: 14px;
+            font-size: 15px;
+            font-weight: 600;
+            cursor: pointer;
+            transition: all 0.2s ease;
+            display: flex;
+            justify-content: center;
+            align-items: center;
+            gap: 10px;
+            box-shadow: 0 4px 12px rgba(0,0,0,0.05);
+        }
+        .btn-primary { background: var(--primary); color: white; }
+        .btn-primary:active { transform: scale(0.98); background: var(--secondary); }
+        .btn-accent { background: var(--accent); color: white; }
+        .btn-accent:active { transform: scale(0.98); filter: brightness(0.9); }
+        .btn-danger { background: var(--danger); color: white; }
+        .btn-success { background: var(--success); color: white; }
+
+        /* Formulir Input & Ikon */
+        .input-group {
+            margin-bottom: 16px;
+            position: relative;
+        }
+        .input-group i {
+            position: absolute;
+            left: 16px;
+            top: 50%;
+            transform: translateY(-50%);
+            color: var(--text-light);
+            font-size: 16px;
+        }
+        .form-control {
+            width: 100%;
+            padding: 14px 14px 14px 48px;
+            border: 1.5px solid var(--border);
+            border-radius: 14px;
+            font-size: 14px;
+            outline: none;
+            transition: all 0.2s;
+            background: #FAFAFA;
+            color: var(--text-dark);
+        }
+        .form-control:focus {
+            border-color: var(--primary);
+            background: #FFFFFF;
+            box-shadow: 0 0 0 4px rgba(30, 58, 138, 0.08);
+        }
+
+        /* Header Dashboard Bergradasi */
+        .dashboard-header {
+            background: linear-gradient(135deg, var(--primary), var(--secondary));
+            color: white;
+            padding: 24px 20px;
+            border-radius: 0 0 24px 24px;
+            position: relative;
+            margin: -20px -20px 20px -20px;
+            box-shadow: 0 10px 20px rgba(30, 58, 138, 0.15);
+        }
+        .dashboard-header .user-info {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+        }
+        .balance-card {
+            background: rgba(255, 255, 255, 0.15);
+            padding: 16px;
+            border-radius: 16px;
+            margin-top: 18px;
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            backdrop-filter: blur(8px);
+            border: 1px solid rgba(255, 255, 255, 0.2);
+        }
+        .balance-amount { font-size: 22px; font-weight: 800; letter-spacing: 0.5px; }
+        .topup-btn {
+            background: white;
+            color: var(--primary);
+            padding: 8px 16px;
+            border-radius: 20px;
+            font-weight: 600;
+            font-size: 13px;
+            cursor: pointer;
+            border: none;
+            box-shadow: 0 2px 6px rgba(0,0,0,0.1);
+        }
+        .nav-icon { color: white; font-size: 22px; cursor: pointer; transition: opacity 0.2s; }
+        .nav-icon:active { opacity: 0.7; }
+
+        /* Grid Menu Layanan Penumpang (Bike, Car, Delivery) */
+        .service-grid {
+            display: grid;
+            grid-template-columns: repeat(3, 1fr);
+            gap: 14px;
+            margin-bottom: 24px;
+        }
+        .service-card {
+            background: white;
+            border: 1.5px solid var(--border);
+            border-radius: 18px;
+            padding: 20px 10px;
+            text-align: center;
+            cursor: pointer;
+            transition: all 0.2s ease;
+            box-shadow: 0 4px 12px rgba(0,0,0,0.02);
+        }
+        .service-card:active { transform: scale(0.95); border-color: var(--primary); background: #F8FAFC; }
+        .service-card i { font-size: 32px; color: var(--primary); margin-bottom: 10px; }
+        .service-card span { display: block; font-size: 13px; font-weight: 600; color: var(--text-dark); }
+
+        /* Sakelar / Toggle Switch Status Driver */
+        .toggle-container {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            background: white;
+            padding: 18px 20px;
+            border-radius: 16px;
+            border: 1.5px solid var(--border);
+            margin-bottom: 24px;
+            box-shadow: 0 2px 8px rgba(0,0,0,0.02);
+        }
+        .switch { position: relative; display: inline-block; width: 56px; height: 30px; }
+        .switch input { opacity: 0; width: 0; height: 0; }
+        .slider-toggle {
+            position: absolute; cursor: pointer; top: 0; left: 0; right: 0; bottom: 0;
+            background-color: #CBD5E1; transition: .3s; border-radius: 30px;
+        }
+        .slider-toggle:before {
+            position: absolute; content: ""; height: 24px; width: 24px; left: 3px; bottom: 3px;
+            background-color: white; transition: .3s; border-radius: 50%;
+            box-shadow: 0 2px 4px rgba(0,0,0,0.2);
+        }
+        input:checked + .slider-toggle { background-color: var(--success); }
+        input:disabled + .slider-toggle { background-color: #E2E8F0; cursor: not-allowed; }
+        input:checked + .slider-toggle:before { transform: translateX(26px); }
+
+        /* Sistem Modal / Pop-up Full Screen Bawah */
+        .modal {
+            display: none;
+            position: fixed;
+            z-index: 2000;
+            left: 0;
+            top: 0;
+            width: 100%;
+            height: 100%;
+            background-color: rgba(0, 0, 0, 0.55);
+            backdrop-filter: blur(5px);
+        }
+        .modal-content {
+            background-color: #FFFFFF;
+            margin: auto;
+            padding: 28px 24px;
+            border-radius: 24px 24px 0 0;
+            width: 100%;
+            max-width: 480px;
+            position: absolute;
+            bottom: 0;
+            left: 50%;
+            transform: translateX(-50%);
+            animation: slideUpModal 0.3s cubic-bezier(0.16, 1, 0.3, 1);
+            box-shadow: 0 -10px 30px rgba(0,0,0,0.1);
+        }
+        @keyframes slideUpModal {
+            from { bottom: -100%; opacity: 0; }
+            to { bottom: 0; opacity: 1; }
+        }
+        .close-modal {
+            position: absolute;
+            right: 20px;
+            top: 20px;
+            font-size: 22px;
+            color: var(--text-light);
+            cursor: pointer;
+            width: 36px;
+            height: 36px;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            border-radius: 50%;
+            background: var(--background);
+        }
+
+        /* Kotak Dialog Kustom (Pengganti Alert/Confirm Bawaan Browser) */
+        .custom-dialog-box {
+            background-color: #FFFFFF;
+            margin: auto;
+            padding: 30px 24px;
+            border-radius: 20px;
+            width: 88%;
+            max-width: 380px;
+            position: absolute;
+            top: 50%;
+            left: 50%;
+            transform: translate(-50%, -50%);
+            text-align: center;
+            box-shadow: 0 20px 40px rgba(0,0,0,0.15);
+            animation: scaleUpDialog 0.25s ease;
+        }
+        @keyframes scaleUpDialog {
+            from { transform: translate(-50%, -50%) scale(0.9); opacity: 0; }
+            to { transform: translate(-50%, -50%) scale(1); opacity: 1; }
+        }
+
+        /* Laci Transaksi Aktif Mengambang di Bawah */
+        .active-transaction-drawer {
+            position: fixed;
+            bottom: 24px;
+            left: 50%;
+            transform: translateX(-50%);
+            width: 90%;
+            max-width: 440px;
+            background: white;
+            border-radius: 18px;
+            padding: 16px 20px;
+            box-shadow: 0 10px 30px rgba(30, 58, 138, 0.15);
+            border-left: 6px solid var(--accent);
+            display: none;
+            z-index: 1000;
+            cursor: pointer;
+            border: 1px solid var(--border);
+            border-left-width: 6px;
+        }
+
+        /* Tombol Geser (Slide-to-Action untuk Driver) */
+        .slider-btn-container {
+            position: relative;
+            width: 100%;
+            height: 56px;
+            background: #E2E8F0;
+            border-radius: 28px;
+            overflow: hidden;
+            margin-top: 15px;
+            box-shadow: inset 0 2px 4px rgba(0,0,0,0.06);
+        }
+        .slider-btn-text {
+            position: absolute;
+            width: 100%;
+            line-height: 56px;
+            text-align: center;
+            color: var(--text-dark);
+            font-weight: 700;
+            font-size: 13px;
+            letter-spacing: 0.5px;
+            z-index: 1;
+            pointer-events: none;
+        }
+        .slider-btn-thumb {
+            position: absolute;
+            left: 4px;
+            top: 4px;
+            width: 48px;
+            height: 48px;
+            background: var(--success);
+            border-radius: 50%;
+            cursor: pointer;
+            z-index: 2;
+            display: flex;
+            justify-content: center;
+            align-items: center;
+            color: white;
+            font-size: 18px;
+            box-shadow: 0 4px 10px rgba(16, 185, 129, 0.3);
+            transition: transform 0.1s linear;
+        }
+
+        /* Toast Notifikasi Kecil Mengambang */
+        .toast {
+            visibility: hidden;
+            min-width: 260px;
+            background-color: #111827;
+            color: #fff;
+            text-align: center;
+            border-radius: 12px;
+            padding: 14px 20px;
+            position: fixed;
+            z-index: 3000;
+            left: 50%;
+            bottom: 30px;
+            font-size: 13px;
+            font-weight: 500;
+            transform: translateX(-50%);
+            box-shadow: 0 10px 25px rgba(0,0,0,0.2);
+            transition: opacity 0.3s, bottom 0.3s;
+        }
+        .toast.show {
+            visibility: visible;
+            bottom: 90px;
+            opacity: 1;
+        }
+
+        /* Animasi Spinner Loading Lingkar */
+        .spinner {
+            border: 4px solid #F3F4F6;
+            border-top: 4px solid var(--accent);
+            border-radius: 50%;
+            width: 45px;
+            height: 45px;
+            animation: spinLoader 0.9s linear infinite;
+            margin: 0 auto;
+        }
+        @keyframes spinLoader {
+            0% { transform: rotate(0deg); }
+            100% { transform: rotate(360deg); }
+        }
+
+        /* Ruang Obrolan Chat */
+        .chat-container {
+            max-height: 280px;
+            min-height: 200px;
+            overflow-y: auto;
+            background: #F8FAFC;
+            padding: 15px;
+            border-radius: 14px;
+            margin-bottom: 15px;
+            border: 1px solid var(--border);
+            display: flex;
+            flex-direction: column;
+            gap: 8px;
+        }
+        .chat-bubble {
+            padding: 10px 16px;
+            border-radius: 16px;
+            max-width: 82%;
+            font-size: 13.5px;
+            line-height: 1.4;
+            box-shadow: 0 2px 4px rgba(0,0,0,0.02);
+        }
+        .chat-mine {
+            background: var(--primary);
+            color: white;
+            align-self: flex-end;
+            border-bottom-right-radius: 4px;
+        }
+        .chat-other {
+            background: #E2E8F0;
+            color: var(--text-dark);
+            align-self: flex-start;
+            border-bottom-left-radius: 4px;
+        }
+    </style>
+</head>
+<body>
+
+    <!-- KOTAK SISTEM: Loader Penghubung Server Firebase -->
+    <div id="sys-loader" class="modal" style="display: none; z-index: 99999; background: rgba(255,255,255,0.92); backdrop-filter: blur(6px);">
+        <div style="position: absolute; top: 50%; left: 50%; transform: translate(-50%, -50%); text-align: center;">
+            <div class="spinner"></div>
+            <h4 style="margin-top: 15px; color: var(--primary); font-size: 16px;">Menghubungkan Server...</h4>
+            <p style="font-size: 12px; color: var(--text-light); margin-top: 4px;">Menyelaraskan data Gageh Surian</p>
+        </div>
+    </div>
+
+    <!-- KOTAK SISTEM: Custom Alert Pengganti Pop-up Bawaan Browser -->
+    <div id="sys-alert" class="modal" style="display: none; z-index: 9999;">
+        <div class="custom-dialog-box">
+            <i class="fa-solid fa-circle-info" style="font-size: 42px; color: var(--accent); margin-bottom: 15px;"></i>
+            <h3 style="color: var(--primary); margin-bottom: 8px; font-size: 18px;">Informasi Penting</h3>
+            <p id="sys-alert-msg" style="margin-bottom: 24px; font-size: 13.5px; line-height: 1.5; color: var(--text-dark);"></p>
+            <button class="btn btn-primary" onclick="document.getElementById('sys-alert').style.display='none'">Mengerti</button>
+        </div>
+    </div>
+
+    <!-- KOTAK SISTEM: Custom Confirm Untuk Menerima / Menolak Pesanan -->
+    <div id="sys-confirm" class="modal" style="display: none; z-index: 9999;">
+        <div class="custom-dialog-box" style="max-width: 400px; text-align: left;">
+            <div style="display: flex; align-items: center; gap: 14px; margin-bottom: 15px;">
+                <div style="background: rgba(30, 58, 138, 0.1); width: 45px; height: 45px; border-radius: 50%; display: flex; align-items: center; justify-content: center;">
+                    <i class="fa-solid fa-bell-concierge" style="font-size: 22px; color: var(--primary);"></i>
+                </div>
+                <div>
+                    <h3 style="color: var(--primary); margin: 0; font-size: 17px;">Pesanan Masuk!</h3>
+                    <p style="font-size: 11px; color: var(--text-light); margin: 0;">Segera ambil sebelum keduluan driver lain</p>
+                </div>
+            </div>
+            <p id="sys-confirm-msg" style="margin-bottom: 22px; font-size: 13.5px; line-height: 1.6; background: var(--background); padding: 14px; border-radius: 12px; color: var(--text-dark); white-space: pre-wrap;"></p>
+            <div style="display: flex; gap: 10px;">
+                <button class="btn btn-danger" id="btn-sys-no" style="flex: 1; padding: 12px; font-size: 14px;"><i class="fa-solid fa-xmark"></i> Tolak</button>
+                <button class="btn btn-success" id="btn-sys-yes" style="flex: 1; padding: 12px; font-size: 14px; background: var(--success);"><i class="fa-solid fa-check"></i> Terima</button>
+            </div>
+        </div>
+    </div>
+
+    <!-- Container Aplikasi Utama -->
+    <div class="app-container" id="app">
+        <!-- ======================================================================= -->
+        <!-- SEGMEN 3: STRUKTUR ANTARMUKA APLIKASI (HTML ELEMENTS)                   -->
+        <!-- ======================================================================= -->
+
+        <!-- 1. HALAMAN UTAMA (WELCOME SCREEN) -->
+        <div id="page-welcome" class="page active">
+            <div style="text-align: center; margin-top: 25vh;">
+                <div style="background: rgba(30, 58, 138, 0.08); width: 90px; height: 90px; border-radius: 50%; display: flex; align-items: center; justify-content: center; margin: 0 auto 20px auto;">
+                    <i class="fa-solid fa-motorcycle" style="font-size: 45px; color: var(--primary);"></i>
+                </div>
+                <h1 style="font-weight: 800; letter-spacing: 0.5px; font-size: 26px;">GAGEH SURIAN</h1>
+                <p style="color: var(--text-light); margin-bottom: 35px; font-size: 14px;">Layanan Ojek & Kurir Pintar Khusus Nagari Surian</p>
+                
+                <button class="btn btn-primary mb-4" onclick="openModal('modal-login-driver')">
+                    <i class="fa-solid fa-helmet-safety"></i> Masuk sebagai Driver
+                </button>
+                <button class="btn btn-accent" onclick="openModal('modal-login-passenger')">
+                    <i class="fa-solid fa-user"></i> Masuk sebagai Penumpang
+                </button>
+            </div>
+        </div>
+
+        <!-- 2. MODAL PENDAFTARAN / LOGIN DRIVER -->
+        <div id="modal-login-driver" class="modal">
+            <div class="modal-content">
+                <span class="close-modal" onclick="closeModal('modal-login-driver')">&times;</span>
+                <h3 class="mb-4" style="font-size: 20px;">Pendaftaran Driver Gageh</h3>
+                <p style="font-size: 12px; color: var(--text-light); margin-bottom: 20px;">Dapatkan ID Driver 6 digit huruf & angka kapital secara otomatis.</p>
+                
+                <div class="input-group">
+                    <i class="fa-solid fa-id-card"></i>
+                    <input type="text" id="driver-name" class="form-control" placeholder="Nama Lengkap Driver">
+                </div>
+                <div class="input-group">
+                    <i class="fa-brands fa-whatsapp"></i>
+                    <input type="number" id="driver-wa" class="form-control" placeholder="Nomor WhatsApp Aktif">
+                </div>
+                <div class="input-group">
+                    <i class="fa-solid fa-car-side"></i>
+                    <!-- style text-transform uppercase memastikan plat nomor otomatis huruf kapital -->
+                    <input type="text" id="driver-plat" class="form-control" placeholder="No. Polisi Kendaraan (Contoh: BA 1234 XX)" style="text-transform: uppercase;">
+                </div>
+                <div class="input-group">
+                    <i class="fa-solid fa-layer-group" style="left: 16px; top: 50%; transform: translateY(-50%); position: absolute; color: var(--text-light);"></i>
+                    <select id="driver-type" class="form-control" style="padding-left: 48px;">
+                        <option value="bike">Gageh Bike (Sepeda Motor)</option>
+                        <option value="car">Gageh Car (Mobil)</option>
+                    </select>
+                </div>
+                <button class="btn btn-primary mt-4" onclick="loginDriver()">Daftar & Masuk Dasbor</button>
+            </div>
+        </div>
+
+        <!-- 3. MODAL LOGIN PENUMPANG -->
+        <div id="modal-login-passenger" class="modal">
+            <div class="modal-content">
+                <span class="close-modal" onclick="closeModal('modal-login-passenger')">&times;</span>
+                <h3 class="mb-4" style="font-size: 20px;">Masuk Sebagai Penumpang</h3>
+                <p style="font-size: 12px; color: var(--text-light); margin-bottom: 20px;">Masukkan nama Anda untuk langsung memesan perjalanan di Nagari Surian.</p>
+                
+                <div class="input-group">
+                    <i class="fa-solid fa-user"></i>
+                    <input type="text" id="passenger-name" class="form-control" placeholder="Nama Lengkap Anda">
+                </div>
+                <button class="btn btn-accent mt-4" onclick="loginPassenger()">Mulai Pesan Sekarang</button>
+            </div>
+        </div>
+
+        <!-- 4. HALAMAN DASHBOARD DRIVER -->
+        <div id="page-driver-dashboard" class="page">
+            <div class="dashboard-header">
+                <div class="user-info">
+                    <div>
+                        <p style="font-size: 11px; opacity: 0.85; text-transform: uppercase; letter-spacing: 0.5px;">Driver Partner</p>
+                        <h3 id="display-driver-name" style="color: white; margin: 0; font-size: 18px;">Nama Driver</h3>
+                    </div>
+                    <!-- Menu Riwayat & Akun di Pojok Kanan Atas -->
+                    <i class="fa-solid fa-bars nav-icon" onclick="openDriverHistoryModal()"></i>
+                </div>
+                <div class="balance-card">
+                    <div>
+                        <p style="font-size: 11px; opacity: 0.9;">Sisa Saldo Driver</p>
+                        <div class="balance-amount" id="display-driver-balance">Rp 0</div>
+                    </div>
+                    <button class="topup-btn" onclick="openTopUpModal()">
+                        <i class="fa-solid fa-wallet"></i> Top Up
+                    </button>
+                </div>
+            </div>
+
+            <!-- Toggle Status Terima Order (Dikunci otomatis jika saldo < Rp 1.500) -->
+            <div class="toggle-container">
+                <div>
+                    <h4 style="margin:0; color: var(--text-dark); font-size: 15px;">Terima Orderan</h4>
+                    <p style="font-size: 11.5px; color: var(--text-light); margin:0;">Minimal Saldo Rp 1.500</p>
+                </div>
+                <label class="switch">
+                    <input type="checkbox" id="toggle-status" onchange="toggleDriverStatus(this)">
+                    <span class="slider-toggle"></span>
+                </label>
+            </div>
+
+            <h3 class="mb-4" style="font-size: 16px;">Orderan Masuk di Sekitar Anda</h3>
+            <div id="order-list-container">
+                <div style="text-align: center; padding: 40px 20px; color: var(--text-light);">
+                    <i class="fa-solid fa-satellite-dish" style="font-size: 36px; margin-bottom: 12px; opacity: 0.4;"></i>
+                    <p style="font-size: 13px;">Aktifkan toggle di atas untuk mulai memindai orderan di Nagari Surian.</p>
+                </div>
+            </div>
+        </div>
+
+        <!-- 5. HALAMAN DASHBOARD PENUMPANG -->
+        <div id="page-passenger-dashboard" class="page">
+            <div class="dashboard-header" style="background: linear-gradient(135deg, var(--accent), #D97706);">
+                <div class="user-info">
+                    <div>
+                        <p style="font-size: 11px; opacity: 0.9; text-transform: uppercase;">Layanan Warga</p>
+                        <h3 id="display-passenger-name" style="color: white; margin: 0; font-size: 18px;">Nama Penumpang</h3>
+                    </div>
+                    <i class="fa-solid fa-right-from-bracket nav-icon" onclick="logout()" title="Keluar Akun"></i>
+                </div>
+            </div>
+
+            <p style="font-size: 13px; font-weight: 600; margin-bottom: 12px; color: var(--text-dark);">Pilih Layanan Perjalanan:</p>
+            <div class="service-grid">
+                <div class="service-card" onclick="openOrderModal('bike')">
+                    <i class="fa-solid fa-motorcycle"></i>
+                    <span>Gageh Bike</span>
+                </div>
+                <div class="service-card" onclick="openOrderModal('car')">
+                    <i class="fa-solid fa-car"></i>
+                    <span>Gageh Car</span>
+                </div>
+                <div class="service-card" onclick="openOrderModal('delivery')">
+                    <i class="fa-solid fa-box-open"></i>
+                    <span>Delivery</span>
+                </div>
+            </div>
+            
+            <h3 style="font-size: 15px; margin-bottom: 12px;">Panduan Singkat Warga</h3>
+            <div style="background: white; border: 1.5px solid var(--border); padding: 16px; border-radius: 16px; font-size: 12.5px; color: var(--text-light); line-height: 1.5;">
+                <p style="margin-bottom: 8px;"><i class="fa-solid fa-circle-check" style="color: var(--success); margin-right: 6px;"></i> Penumpang bebas memasukkan penawaran ongkos secara manual.</p>
+                <p style="margin-bottom: 8px;"><i class="fa-solid fa-circle-check" style="color: var(--success); margin-right: 6px;"></i> Driver terdekat akan langsung menerima notifikasi panggilan & getar.</p>
+                <p><i class="fa-solid fa-circle-check" style="color: var(--success); margin-right: 6px;"></i> Obrolan aman: Nomor HP/WA otomatis disensor privasinya.</p>
+            </div>
+        </div>
+
+        <!-- 6. MODAL TOP UP SALDO DRIVER -->
+        <div id="modal-topup" class="modal">
+            <div class="modal-content">
+                <span class="close-modal" onclick="closeModal('modal-topup')">&times;</span>
+                <h3 class="mb-4" style="font-size: 20px;">Top Up Saldo Driver</h3>
+                
+                <div style="background: #EFF6FF; border: 1.5px solid #BFDBFE; padding: 16px; border-radius: 14px; margin-bottom: 20px;">
+                    <p style="font-size: 11px; color: #1D4ED8; font-weight: 600; margin-bottom: 4px; text-transform: uppercase;">Silakan Transfer Sesuai Nominal Ke:</p>
+                    <h4 style="color: var(--primary); font-size: 16px; margin-bottom: 2px;">TOTA RAHMAN</h4>
+                    <p style="font-size: 14px; font-weight: 700; color: var(--text-dark);">Bank Mandiri: 1110023034784</p>
+                </div>
+
+                <div class="input-group">
+                    <i class="fa-solid fa-id-badge"></i>
+                    <!-- ID Driver terkunci otomatis tidak dapat diubah -->
+                    <input type="text" id="topup-driver-id" class="form-control" readonly style="background: #F1F5F9; color: #475569; font-weight: 700; letter-spacing: 1px;">
+                </div>
+                <div class="input-group">
+                    <i class="fa-solid fa-rupiah-sign"></i>
+                    <input type="text" id="topup-amount" class="form-control" placeholder="Masukkan Jumlah Nominal Top Up" oninput="formatInputRibuan(this)">
+                </div>
+                <button class="btn btn-primary mt-4" onclick="submitTopUp()">Kirim Permintaan Ke Admin</button>
+            </div>
+        </div>
+
+        <!-- 7. MODAL PEMBUATAN ORDER (PENUMPANG) -->
+        <div id="modal-order" class="modal">
+            <div class="modal-content">
+                <span class="close-modal" onclick="closeModal('modal-order')">&times;</span>
+                <h3 class="mb-4" id="order-title" style="font-size: 20px;">Pesan Layanan</h3>
+                
+                <!-- Input Khusus Layanan Delivery -->
+                <div class="input-group hidden" id="delivery-details-group">
+                    <i class="fa-solid fa-box"></i>
+                    <input type="text" id="order-item" class="form-control" placeholder="Nama barang yang dibeli / diantar">
+                </div>
+
+                <div class="input-group">
+                    <i class="fa-solid fa-location-dot" style="color: var(--danger);"></i>
+                    <input type="text" id="order-pickup" class="form-control" placeholder="Nama Titik Jemput Lengkap (Jorong/Patokan)">
+                </div>
+                <div class="input-group">
+                    <i class="fa-solid fa-location-crosshairs" style="color: var(--success);"></i>
+                    <input type="text" id="order-dropoff" class="form-control" placeholder="Nama Titik Tujuan Lengkap">
+                </div>
+                <div class="input-group">
+                    <i class="fa-solid fa-tags"></i>
+                    <input type="text" id="order-price" class="form-control" placeholder="Tawaran Ongkos (Cth: 15.000)" oninput="formatInputRibuan(this)">
+                </div>
+                <button class="btn btn-accent mt-4" onclick="findDriver()">Cari Driver Terdekat</button>
+            </div>
+        </div>
+
+        <!-- 8. LACI TRANSAKSI AKTIF (MELAYANG DI BAWAH) -->
+        <div id="active-transaction-drawer" class="active-transaction-drawer" onclick="openActiveOrderDetails()">
+            <div style="display: flex; justify-content: space-between; align-items: center;">
+                <div>
+                    <h4 style="margin: 0; color: var(--primary); font-size: 14px;" id="drawer-title">Perjalanan Aktif</h4>
+                    <p style="margin: 0; font-size: 12px; color: var(--text-light);" id="drawer-status">Menghubungkan sistem...</p>
+                </div>
+                <i class="fa-solid fa-chevron-up" style="color: var(--text-light); font-size: 14px;"></i>
+            </div>
+        </div>
+
+        <!-- 9. MODAL DETAIL PESANAN & RUANG CHAT/TELEPON -->
+        <div id="modal-order-details" class="modal" style="background: white;">
+            <div style="padding: 20px; height: 100vh; overflow-y: auto; display: flex; flex-direction: column;">
+                <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 18px;">
+                    <h3 style="margin:0; font-size: 18px;">Detail Pesanan & Obrolan</h3>
+                    <i class="fa-solid fa-times" style="font-size: 22px; cursor: pointer; padding: 6px;" onclick="closeModal('modal-order-details')"></i>
+                </div>
+
+                <!-- Kotak Ringkasan Transaksi -->
+                <div style="background: var(--background); padding: 16px; border-radius: 14px; margin-bottom: 15px; border: 1px solid var(--border);">
+                    <p style="font-size: 11px; color: var(--text-light); margin-bottom: 4px;">ID Transaksi (16 Karakter): <span id="detail-trx-id" style="font-weight: 700; color: var(--text-dark);"></span></p>
+                    <h2 id="detail-price" style="color: var(--accent); margin: 4px 0 10px 0; font-size: 24px;">Rp 0</h2>
+                    <p style="font-size: 13px; margin-bottom: 4px;"><strong>Jemput:</strong> <span id="detail-pickup"></span></p>
+                    <p style="font-size: 13px; margin-bottom: 12px;"><strong>Tujuan:</strong> <span id="detail-dropoff"></span></p>
+                    
+                    <div style="display: flex; gap: 10px;">
+                        <button class="btn" style="background: white; border: 1.5px solid var(--border); color: var(--primary); padding: 10px; font-size: 13px;" onclick="openGPS()">
+                            <i class="fa-solid fa-map-location-dot"></i> Navigasi GPS
+                        </button>
+                        <button class="btn btn-success" style="background: var(--success); color: white; padding: 10px; font-size: 13px;" onclick="ringPhone()">
+                            <i class="fa-solid fa-phone-volume"></i> Telepon Suara
+                        </button>
+                    </div>
+                </div>
+
+                <!-- Ruang Chat Anti-No HP -->
+                <p style="font-size: 12px; font-weight: 600; margin-bottom: 6px; color: var(--text-light);">Obrolan Pesanan (Sensor Nomor HP Aktif):</p>
+                <div class="chat-container" id="chat-box"></div>
+                
+                <div style="display: flex; gap: 8px; margin-bottom: 15px;">
+                    <input type="text" id="chat-input" class="form-control" placeholder="Ketik pesan (Dilarang berbagi No HP)..." style="flex-grow: 1; padding: 12px 14px;">
+                    <button class="btn btn-primary" style="width: auto; padding: 0 20px;" onclick="sendChat()">
+                        <i class="fa-solid fa-paper-plane"></i>
+                    </button>
+                </div>
+
+                <!-- Tombol Geser (Slide-to-Action khusus Driver) -->
+                <div id="driver-actions" class="hidden" style="margin-top: auto; padding-bottom: 20px;">
+                    <!-- Slider 1: Menuju Lokasi / Sudah Sampai -->
+                    <div class="slider-btn-container" id="slider-pickup">
+                        <div class="slider-btn-text">GESER: KELOKASI / TIBA</div>
+                        <div class="slider-btn-thumb"><i class="fa-solid fa-arrow-right"></i></div>
+                    </div>
+                    <!-- Slider 2: Selesaikan Perjalanan & Potong Saldo -->
+                    <div class="slider-btn-container hidden" id="slider-finish" style="margin-top: 10px;">
+                        <div class="slider-btn-text" style="color: white; background: var(--success); border-radius: 28px;">GESER: SELESAIKAN PERJALANAN</div>
+                        <div class="slider-btn-thumb" style="background: var(--primary);"><i class="fa-solid fa-check"></i></div>
+                    </div>
+                </div>
+            </div>
+        </div>
+
+        <!-- 10. MODAL RIWAYAT AKUN & TRANSAKSI (DRIVER) -->
+        <div id="modal-history" class="modal">
+            <div class="modal-content">
+                <span class="close-modal" onclick="closeModal('modal-history')">&times;</span>
+                <h3 class="mb-4" style="font-size: 20px;">Riwayat & Detail Akun</h3>
+                
+                <div style="background: var(--background); padding: 14px; border-radius: 12px; margin-bottom: 15px; font-size: 13px;">
+                    <p><strong>ID Driver (6 Karakter):</strong> <span id="hist-driver-id" style="color: var(--primary); font-weight: 700;"></span></p>
+                    <p><strong>Plat Nomor:</strong> <span id="hist-driver-plat"></span></p>
+                </div>
+
+                <p style="font-size: 13px; font-weight: 600; margin-bottom: 8px;">Daftar Transaksi / Top Up Terakhir:</p>
+                <div id="history-list" style="max-height: 220px; overflow-y: auto; margin-bottom: 20px; border: 1.5px solid var(--border); border-radius: 12px; padding: 10px; background: #FAFAFA;">
+                    <p class="text-center" style="color: var(--text-light); font-size: 12px; padding: 20px;">Belum ada riwayat transaksi.</p>
+                </div>
+                
+                <button class="btn btn-danger" onclick="logout()"><i class="fa-solid fa-power-off"></i> Keluar Akun (Log Out)</button>
+            </div>
+        </div>
+
+        <!-- Toast Notification & Elemen Audio Panggilan -->
+        <div id="toast" class="toast">Notifikasi Gageh Surian</div>
+        <audio id="audio-ring" loop src="https://assets.mixkit.co/active_storage/sfx/2870/2870-preview.mp3"></audio>
+        <audio id="audio-notif" src="https://assets.mixkit.co/active_storage/sfx/2869/2869-preview.mp3"></audio>
+
+    </div> <!-- Penutup .app-container -->
+    <!-- ======================================================================= -->
+    <!-- SEGMEN 4: LOGIKA SISTEM JAVASCRIPT (SESI, LOKASI GPS, & AUTENTIKASI)     -->
+    <!-- ======================================================================= -->
+    <script>
+        /* --- 1. KONTROL SISTEM: LOADER, CUSTOM ALERT & CONFIRM --- */
+        
+        // Memantau status koneksi real-time dengan Firebase
+        const connectedRef = db.ref(".info/connected");
+        let loadingTimer;
+        connectedRef.on("value", (snap) => {
+            const loader = document.getElementById('sys-loader');
+            if (snap.val() === true) {
+                clearTimeout(loadingTimer);
+                loader.style.display = 'none';
+            } else {
+                clearTimeout(loadingTimer);
+                loadingTimer = setTimeout(() => { loader.style.display = 'block'; }, 1200);
+            }
+        });
+        // Failsafe pengaman loader agar tidak mengunci layar melebihi 5 detik
+        setTimeout(() => { document.getElementById('sys-loader').style.display = 'none'; }, 5000);
+
+        // Menimpa (Override) fungsi alert bawaan browser agar menggunakan desain kustom
+        window.alert = function(message) {
+            document.getElementById('sys-alert-msg').innerText = message;
+            document.getElementById('sys-alert').style.display = 'block';
+        };
+
+        // Fungsi dialog konfirmasi kustom untuk interaksi pesanan
+        function showCustomConfirm(message, callbackYes, callbackNo) {
+            document.getElementById('sys-confirm-msg').innerText = message;
+            document.getElementById('sys-confirm').style.display = 'block';
+            
+            document.getElementById('btn-sys-yes').onclick = function() {
+                document.getElementById('sys-confirm').style.display = 'none';
+                if(callbackYes) callbackYes();
+            };
+            document.getElementById('btn-sys-no').onclick = function() {
+                document.getElementById('sys-confirm').style.display = 'none';
+                if(callbackNo) callbackNo();
+            };
+        }
+
+        /* --- 2. KONTROL TAMPILAN MODAL & TOAST --- */
+        function openModal(id) { document.getElementById(id).style.display = 'block'; }
+        function closeModal(id) { document.getElementById(id).style.display = 'none'; }
+        
+        function showToast(message) {
+            const toast = document.getElementById("toast");
+            toast.innerText = message; 
+            toast.className = "toast show";
+            setTimeout(() => { toast.className = toast.className.replace("show", ""); }, 4000);
+        }
+
+        /* --- 3. SISTEM LOKASI GPS AKURAT & SERVER KECAMATAN --- */
+        function getLocation(callback) {
+            if (navigator.geolocation) {
+                navigator.geolocation.getCurrentPosition(
+                    async (position) => {
+                        const lat = position.coords.latitude;
+                        const lng = position.coords.longitude;
+                        
+                        try {
+                            // Mengambil data wilayah administratif secara presisi
+                            const response = await fetch(`https://nominatim.openstreetmap.org/reverse?format=json&lat=${lat}&lon=${lng}&zoom=14`);
+                            const data = await response.json();
+                            const kecamatan = data.address.city_district || data.address.suburb || data.address.village || data.address.town || data.address.county || "Surian";
+                            
+                            currentLocation = { lat: lat, lng: lng, kecamatan: kecamatan };
+                            
+                            // Pop-up pemberitahuan wilayah server pertemuan
+                            alert(`Anda terdeteksi di kawasan "${kecamatan}" berdasarkan titik GPS akurat perangkat.`);
+                            if (callback) callback();
+                        } catch (error) {
+                            currentLocation = { lat: lat, lng: lng, kecamatan: "Surian" };
+                            alert(`Anda terdeteksi di kawasan "Surian" (Mode Jaringan Offline).`);
+                            if (callback) callback();
+                        }
+                    },
+                    (error) => {
+                        // Penanganan jika izin GPS ditolak atau gagal memuat
+                        alert("Gagal memuat lokasi GPS. Mohon izinkan akses lokasi pada pengaturan perangkat Anda agar dapat terhubung ke server area Nagari Surian.");
+                        // Fallback menggunakan koordinat default Surian agar aplikasi tetap dapat diakses
+                        currentLocation = { lat: -1.0900, lng: 100.7500, kecamatan: "Surian" };
+                        if (callback) callback();
+                    },
+                    { enableHighAccuracy: true, timeout: 8000, maximumAge: 0 }
+                );
+            } else {
+                alert("Perangkat Anda tidak mendukung fitur GPS.");
+                if (callback) callback();
+            }
+        }
+
+        /* --- 4. AUTENTIKASI AKUN & PERSISTENSI SESI (ANTI-LOGOUT SAAT REFRESH) --- */
+        function loginDriver() {
+            const name = document.getElementById('driver-name').value;
+            const wa = document.getElementById('driver-wa').value;
+            const plat = document.getElementById('driver-plat').value.toUpperCase();
+            const type = document.getElementById('driver-type').value;
+
+            if(!name || !wa || !plat) {
+                alert("Harap lengkapi seluruh kolom formulir pendaftaran driver!");
+                return;
+            }
+
+            getLocation(() => {
+                const driverId = generateDriverID(); // 6 digit huruf & angka kapital
+                const sessionData = {
+                    role: 'driver',
+                    id: driverId,
+                    name: name,
+                    wa: wa,
+                    plat: plat,
+                    type: type,
+                    balance: 0,
+                    status: 'offline'
+                };
+                
+                // Simpan data ke database Firebase
+                db.ref('users/' + driverId).set(sessionData);
+
+                // Simpan sesi lokal agar kebal refresh / tutup browser
+                localStorage.setItem('gageh_session', JSON.stringify(sessionData));
+                currentUser = sessionData;
+                userRole = 'driver';
+
+                closeModal('modal-login-driver');
+                loadDashboard();
+            });
+        }
+
+        function loginPassenger() {
+            const name = document.getElementById('passenger-name').value;
+            if(!name) {
+                alert("Masukkan nama lengkap Anda terlebih dahulu!");
+                return;
+            }
+
+            getLocation(() => {
+                const passId = "PASS_" + Date.now();
+                const sessionData = {
+                    role: 'passenger',
+                    id: passId,
+                    name: name
+                };
+                
+                localStorage.setItem('gageh_session', JSON.stringify(sessionData));
+                currentUser = sessionData;
+                userRole = 'passenger';
+                
+                closeModal('modal-login-passenger');
+                loadDashboard();
+            });
+        }
+
+        function logout() {
+            localStorage.removeItem('gageh_session');
+            if(userRole === 'driver' && currentUser) {
+                db.ref('users/' + currentUser.id + '/status').set('offline');
+            }
+            currentUser = null;
+            userRole = '';
+            
+            document.querySelectorAll('.page').forEach(p => p.classList.remove('active'));
+            document.getElementById('page-welcome').classList.add('active');
+            closeModal('modal-history');
+            closeModal('modal-order-details');
+        }
+
+        /* --- 5. RENDER DASBOR DAN SINKRONISASI REALTIME --- */
+        function loadDashboard() {
+            document.querySelectorAll('.page').forEach(p => p.classList.remove('active'));
+
+            if (userRole === 'driver') {
+                document.getElementById('page-driver-dashboard').classList.add('active');
+                document.getElementById('display-driver-name').innerText = currentUser.name;
+                
+                const toggle = document.getElementById('toggle-status');
+
+                // Sinkronisasi saldo dan status driver secara real-time dari Firebase
+                db.ref('users/' + currentUser.id).on('value', snap => {
+                    const data = snap.val();
+                    if(data) {
+                        currentUser.balance = data.balance || 0;
+                        currentUser.status = data.status || 'offline';
+                        
+                        document.getElementById('display-driver-balance').innerText = formatRupiah(currentUser.balance);
+                        
+                        // Validasi saldo minimal Rp 1.500 untuk mengaktifkan toggle orderan
+                        if(currentUser.balance < 1500) {
+                            toggle.checked = false;
+                            toggle.disabled = true;
+                            if (data.status === 'online') {
+                                db.ref('users/' + currentUser.id + '/status').set('offline');
+                            }
+                        } else {
+                            toggle.disabled = false;
+                            toggle.checked = (data.status === 'online');
+                        }
+
+                        localStorage.setItem('gageh_session', JSON.stringify(currentUser));
+                    }
+                });
+
+            } else if (userRole === 'passenger') {
+                document.getElementById('page-passenger-dashboard').classList.add('active');
+                document.getElementById('display-passenger-name').innerText = currentUser.name;
+            }
+        }
+
+        /* --- 6. PEMUTAR SESI OTOMATIS SAAT APLIKASI DIBUKA KEMBALI --- */
+        window.onload = () => {
+            const savedSession = localStorage.getItem('gageh_session');
+            if (savedSession) {
+                currentUser = JSON.parse(savedSession);
+                userRole = currentUser.role;
+                
+                // Muat ulang posisi lokasi secara senyap lalu tampilkan tampilan terakhir
+                getLocation(() => {
+                    loadDashboard();
+                });
+            } else {
+                document.getElementById('page-welcome').classList.add('active');
+            }
+        }
+    </script>
+    <!-- ======================================================================= -->
+    <!-- SEGMEN 5: LOGIKA INTI PEMESANAN, LELANG GPS, & TRANSAKSI (FINAL)        -->
+    <!-- ======================================================================= -->
+    <script>
+        /* --- 1. KONTROL STATUS ONLINE / OFFLINE DRIVER --- */
+        function toggleDriverStatus(checkbox) {
+            if(currentUser.balance < 1500) {
+                alert("Saldo Anda kurang dari Rp 1.500. Silakan lakukan Top Up terlebih dahulu untuk mengaktifkan status online.");
+                checkbox.checked = false;
+                return;
+            }
+            const status = checkbox.checked ? 'online' : 'offline';
+            db.ref('users/' + currentUser.id).update({
+                status: status,
+                lat: currentLocation.lat,
+                lng: currentLocation.lng,
+                kecamatan: currentLocation.kecamatan
+            });
+            showToast(`Status Anda kini: ${status.toUpperCase()}`);
+            if(status === 'online') {
+                listenForOrders();
+            }
+        }
+
+        /* --- 2. PEMBUATAN PESANAN OLEH PENUMPANG & LELANG DRIVER TERDEKAT --- */
+        function openOrderModal(type) {
+            document.getElementById('modal-order').style.display = 'block';
+            document.getElementById('order-title').innerText = type === 'delivery' ? 'Pesan Gageh Delivery' : 'Pesan Gageh ' + type.charAt(0).toUpperCase() + type.slice(1);
+            document.getElementById('delivery-details-group').className = type === 'delivery' ? 'input-group' : 'input-group hidden';
+            document.getElementById('order-price').dataset.type = type;
+        }
+
+        function findDriver() {
+            const pickup = document.getElementById('order-pickup').value;
+            const dropoff = document.getElementById('order-dropoff').value;
+            const price = document.getElementById('order-price').value;
+            const type = document.getElementById('order-price').dataset.type;
+            const item = document.getElementById('order-item').value;
+
+            if(!pickup || !dropoff || !price || (type === 'delivery' && !item)) {
+                alert("Harap lengkapi seluruh detail titik jemput, tujuan, dan tawaran ongkos Anda!");
+                return;
+            }
+
+            closeModal('modal-order');
+            showToast(`Mencari driver terdekat di kawasan ${currentLocation.kecamatan}...`);
+
+            // Memindai driver online di server kecamatan yang sama
+            db.ref('users').orderByChild('role').equalTo('driver').once('value', snapshot => {
+                let availableDrivers = [];
+                snapshot.forEach(child => {
+                    let d = child.val();
+                    if(d.status === 'online' && d.balance >= 1500 && d.kecamatan === currentLocation.kecamatan) {
+                        // Menghitung jarak lurus GPS real-time antara penumpang dan driver
+                        let dist = calculateDistance(currentLocation.lat, currentLocation.lng, d.lat, d.lng);
+                        availableDrivers.push({ id: d.id, distance: dist });
+                    }
+                });
+
+                if(availableDrivers.length === 0) {
+                    alert("Maaf, belum ada driver yang aktif di server kawasan Anda saat ini.");
+                    return;
+                }
+
+                // Mengurutkan driver dari posisi yang paling dekat
+                availableDrivers.sort((a, b) => a.distance - b.distance);
+                const driverQueue = availableDrivers.map(d => d.id);
+                
+                const orderId = generateTransactionID(); // 16 digit huruf & angka kapital
+                const newOrder = {
+                    id: orderId,
+                    passengerId: currentUser.id,
+                    passengerName: currentUser.name,
+                    pickup: pickup,
+                    dropoff: dropoff,
+                    price: price,
+                    type: type,
+                    item: item || '',
+                    lat: currentLocation.lat,
+                    lng: currentLocation.lng,
+                    status: 'searching', // searching, accepted, arrived, completed
+                    queue: driverQueue,
+                    targetDriver: driverQueue[0], // Lempar pertama ke driver terdekat #1
+                    timestamp: Date.now()
+                };
+
+                db.ref('orders/' + orderId).set(newOrder);
+                activeOrderId = orderId;
+                monitorOrder(orderId);
+            });
+        }
+
+        /* --- 3. SISTEM LELANG & PEMBERITAHUAN KE DRIVER --- */
+        window.listenForOrders = function() {
+            function processIncomingOrder(order) {
+                if(order.status === 'searching' && order.targetDriver === currentUser.id) {
+                    playRingTone();
+                    if(navigator.vibrate) navigator.vibrate([600, 300, 600, 300, 600]);
+
+                    showCustomConfirm(
+                        `Tawaran Ongkos: ${order.price}\nDari: ${order.passengerName}\nJemput: ${order.pickup}\nTujuan: ${order.dropoff}`,
+                        () => {
+                            // JIKA DRIVER MENERIMA
+                            stopRingTone();
+                            db.ref('orders/' + order.id).update({
+                                status: 'accepted',
+                                driverId: currentUser.id,
+                                driverName: currentUser.name
+                            });
+                            activeOrderId = order.id;
+                            monitorOrder(order.id);
+                        },
+                        () => {
+                            // JIKA DRIVER MENOLAK -> Lempar ke driver terdekat berikutnya di antrean
+                            stopRingTone();
+                            let currentIdx = order.queue.indexOf(currentUser.id);
+                            if(currentIdx !== -1 && currentIdx < order.queue.length - 1) {
+                                db.ref('orders/' + order.id).update({ targetDriver: order.queue[currentIdx + 1] });
+                            } else {
+                                db.ref('orders/' + order.id).update({ status: 'no_driver' });
+                            }
+                        }
+                    );
+                }
+            }
+
+            db.ref('orders').on('child_added', snapshot => { processIncomingOrder(snapshot.val()); });
+            db.ref('orders').on('child_changed', snapshot => { processIncomingOrder(snapshot.val()); });
+        };
+
+        /* --- 4. PEMANTAUAN STATUS PERJALANAN AKTIF --- */
+        function monitorOrder(orderId) {
+            document.getElementById('active-transaction-drawer').style.display = 'block';
+            
+            db.ref('orders/' + orderId).on('value', snap => {
+                const order = snap.val();
+                if(!order) return;
+                activeOrderData = order;
+
+                const drawerStatus = document.getElementById('drawer-status');
+                
+                if(order.status === 'searching') {
+                    drawerStatus.innerText = 'Mencari driver terdekat...';
+                }
+                if(order.status === 'no_driver') {
+                    drawerStatus.innerText = 'Semua driver sibuk. Pesanan dibatalkan.';
+                    alert("Maaf, seluruh driver terdekat sedang sibuk atau menolak pesanan.");
+                    setTimeout(clearActiveOrder, 2000);
+                }
+                if(order.status === 'accepted') {
+                    drawerStatus.innerText = `Driver ${order.driverName} sedang menuju ke lokasi Anda.`;
+                    showToast("Pesanan diterima oleh driver!");
+                    if(navigator.vibrate) navigator.vibrate([200, 100, 200]);
+                    if(userRole === 'driver') {
+                        document.getElementById('driver-actions').classList.remove('hidden');
+                        initSliders();
+                    }
+                }
+                if(order.status === 'arrived') {
+                    drawerStatus.innerText = 'Driver telah sampai di titik jemput!';
+                    if(userRole === 'passenger') {
+                        showToast("Driver sudah menunggu di lokasi!");
+                        playNotifTone();
+                        if(navigator.vibrate) navigator.vibrate([800, 400, 800]);
+                    }
+                }
+                if(order.status === 'completed') {
+                    drawerStatus.innerText = 'Perjalanan telah selesai.';
+                    showToast("Terima kasih telah menggunakan Gageh Surian!");
+                    if(userRole === 'driver') {
+                        processPayment(orderId);
+                    }
+                    setTimeout(clearActiveOrder, 3500);
+                }
+
+                // Panggilan suara: Berdering terus & bergetar panjang bagi penerima
+                if(order.calling && order.callerId !== currentUser.id) {
+                    playRingTone();
+                    if(navigator.vibrate) navigator.vibrate([1000, 500, 1000, 500, 1000, 500]);
+                    setTimeout(() => {
+                        stopRingTone();
+                        db.ref('orders/' + orderId + '/calling').remove();
+                    }, 10000);
+                }
+
+                document.getElementById('detail-trx-id').innerText = order.id;
+                document.getElementById('detail-price').innerText = order.price;
+                document.getElementById('detail-pickup').innerText = order.pickup;
+                document.getElementById('detail-dropoff').innerText = order.dropoff;
+            });
+
+            // Pantau Obrolan Realtime dengan Sensor Privasi No HP
+            db.ref('orders/' + orderId + '/chats').on('child_added', snap => {
+                let chat = snap.val();
+                let chatBox = document.getElementById('chat-box');
+                let isMine = chat.senderId === currentUser.id;
+                
+                // Menyembunyikan nomor HP/WA secara otomatis jika diketik
+                let safeText = censorPrivateInfo(chat.text);
+                
+                chatBox.innerHTML += `<div class="chat-bubble ${isMine ? 'chat-mine' : 'chat-other'}">${safeText}</div>`;
+                chatBox.scrollTop = chatBox.scrollHeight;
+                if(!isMine) playNotifTone();
+            });
+        }
+
+        function clearActiveOrder() {
+            document.getElementById('active-transaction-drawer').style.display = 'none';
+            closeModal('modal-order-details');
+            activeOrderId = null;
+            activeOrderData = null;
+            document.getElementById('chat-box').innerHTML = '';
+            document.getElementById('slider-pickup').classList.remove('hidden');
+            document.getElementById('slider-finish').classList.add('hidden');
+            document.getElementById('driver-actions').classList.add('hidden');
+        }
+
+        function openActiveOrderDetails() {
+            if(activeOrderId) openModal('modal-order-details');
+        }
+
+        /* --- 5. FITUR CHAT, TELEPON, & NAVIGASI GPS --- */
+        function sendChat() {
+            const inp = document.getElementById('chat-input');
+            if(!inp.value.trim() || !activeOrderId) return;
+            
+            db.ref('orders/' + activeOrderId + '/chats').push({
+                senderId: currentUser.id,
+                text: inp.value.trim(),
+                time: Date.now()
+            });
+            inp.value = '';
+        }
+
+        function ringPhone() {
+            if(!activeOrderId) return;
+            showToast("Menghubungkan panggilan suara...");
+            db.ref('orders/' + activeOrderId).update({
+                calling: true,
+                callerId: currentUser.id
+            });
+        }
+
+        function openGPS() {
+            if(!activeOrderData) return;
+            window.open(`https://www.google.com/maps/dir/?api=1&destination=${activeOrderData.lat},${activeOrderData.lng}`, '_blank');
+        }
+
+        /* --- 6. TOMBOL GESER (SLIDE-TO-ACTION DRIVER) --- */
+        let sliderBound = false;
+        function initSliders() {
+            if(userRole !== 'driver' || sliderBound) return;
+            sliderBound = true;
+
+            const sPickup = document.getElementById('slider-pickup');
+            const sFinish = document.getElementById('slider-finish');
+
+            function setupSlider(container, onSuccess) {
+                const thumb = container.querySelector('.slider-btn-thumb');
+                let isDragging = false, startX, maxDistance;
+
+                thumb.addEventListener('touchstart', (e) => {
+                    isDragging = true;
+                    startX = e.touches[0].clientX;
+                    maxDistance = container.offsetWidth - thumb.offsetWidth - 8;
+                    thumb.style.transition = 'none';
+                });
+
+                thumb.addEventListener('touchmove', (e) => {
+                    if(!isDragging) return;
+                    let moveX = e.touches[0].clientX - startX;
+                    if(moveX > 0 && moveX <= maxDistance) {
+                        thumb.style.transform = `translateX(${moveX}px)`;
+                    }
+                    // Jika digeser lebih dari 85%, anggap aksi selesai
+                    if(moveX > maxDistance * 0.85) {
+                        isDragging = false;
+                        thumb.style.transform = `translateX(${maxDistance}px)`;
+                        onSuccess();
+                        container.classList.add('hidden');
+                    }
+                });
+
+                thumb.addEventListener('touchend', () => {
+                    if(isDragging) {
+                        isDragging = false;
+                        thumb.style.transition = '0.3s';
+                        thumb.style.transform = 'translateX(0)';
+                    }
+                });
+            }
+
+            setupSlider(sPickup, () => {
+                db.ref('orders/' + activeOrderId).update({ status: 'arrived' });
+                sFinish.classList.remove('hidden');
+            });
+
+            setupSlider(sFinish, () => {
+                db.ref('orders/' + activeOrderId).update({ status: 'completed' });
+            });
+        }
+
+        /* --- 7. PEMOTONGAN SALDO OTOMATIS (RP 1.500) --- */
+        function processPayment(orderId) {
+            let updatedBalance = currentUser.balance - 1500;
+            if(updatedBalance < 0) updatedBalance = 0;
+            
+            db.ref('users/' + currentUser.id).update({ balance: updatedBalance });
+            alert("Perjalanan selesai! Saldo akun driver Anda telah dipotong otomatis sebesar Rp 1.500.");
+            
+            if(updatedBalance < 1500) {
+                document.getElementById('toggle-status').checked = false;
+                db.ref('users/' + currentUser.id).update({ status: 'offline' });
+            }
+        }
+
+        /* --- 8. MANAJEMEN TOP UP & RIWAYAT AKUN --- */
+        function openTopUpModal() {
+            document.getElementById('topup-driver-id').value = currentUser.id;
+            openModal('modal-topup');
+        }
+
+        function submitTopUp() {
+            const amountInput = document.getElementById('topup-amount').value;
+            if(!amountInput) {
+                alert("Masukkan jumlah nominal top up terlebih dahulu!");
+                return;
+            }
+
+            db.ref('topup_requests').push({
+                driverId: currentUser.id,
+                driverName: currentUser.name,
+                amount: amountInput,
+                timestamp: Date.now()
+            });
+
+            alert("Permintaan Top Up berhasil dikirim ke panel Admin Kontrol!");
+            closeModal('modal-topup');
+            document.getElementById('topup-amount').value = '';
+        }
+
+        function openDriverHistoryModal() {
+            document.getElementById('hist-driver-id').innerText = currentUser.id;
+            document.getElementById('hist-driver-plat').innerText = currentUser.plat || '-';
+            
+            // Muat data riwayat transaksi dari database
+            db.ref('topup_requests').orderByChild('driverId').equalTo(currentUser.id).once('value', snapshot => {
+                let listContainer = document.getElementById('history-list');
+                listContainer.innerHTML = '';
+                
+                if(!snapshot.exists()) {
+                    listContainer.innerHTML = `<p class="text-center" style="color: var(--text-light); font-size: 12px; padding: 15px;">Belum ada riwayat transaksi.</p>`;
+                } else {
+                    snapshot.forEach(child => {
+                        let req = child.val();
+                        listContainer.innerHTML += `
+                            <div style="background: white; padding: 10px 12px; border-radius: 8px; margin-bottom: 8px; border: 1px solid var(--border);">
+                                <p style="font-size: 11px; color: var(--text-light); margin: 0;">Top Up Saldo</p>
+                                <p style="font-size: 14px; font-weight: 700; color: var(--success); margin: 2px 0;">+ ${formatRupiah(req.amount)}</p>
+                                <p style="font-size: 10px; color: #9CA3AF; margin: 0;">ID Driver: ${req.driverId}</p>
+                            </div>
+                        `;
+                    });
+                }
+            });
+
+            openModal('modal-history');
+        }
+
+        /* --- 9. PENGELOLAAN AUDIO (RINGER & NOTIFIKASI) --- */
+        function playRingTone() {
+            const audio = document.getElementById('audio-ring');
+            if(audio) audio.play().catch(e => console.log("Audio play dibatasi browser"));
+        }
+        function stopRingTone() {
+            const audio = document.getElementById('audio-ring');
+            if(audio) { audio.pause(); audio.currentTime = 0; }
+        }
+        function playNotifTone() {
+            const audio = document.getElementById('audio-notif');
+            if(audio) audio.play().catch(e => console.log("Audio play dibatasi browser"));
+        }
+    </script>
+
+<!-- ======================================================================= -->
+<!-- KODE SUNTIKAN TAMBAHAN: ANIMASI RADAR PENCARIAN & TOMBOL BATAL          -->
+<!-- ======================================================================= -->
+<style>
+    /* Styling Animasi Radar Pencarian Penumpang */
+    .radar-container {
+        display: flex;
+        flex-direction: column;
+        align-items: center;
+        justify-content: center;
+        padding: 30px 20px;
+        text-align: center;
+    }
+    .radar-circle {
+        width: 80px;
+        height: 80px;
+        background: rgba(37, 99, 235, 0.15);
+        border-radius: 50%;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        position: relative;
+        margin-bottom: 20px;
+        animation: radarPulse 1.8s infinite ease-in-out;
+    }
+    .radar-circle i {
+        font-size: 32px;
+        color: var(--secondary);
+    }
+    @keyframes radarPulse {
+        0% { transform: scale(0.95); box-shadow: 0 0 0 0 rgba(37, 99, 235, 0.4); }
+        70% { transform: scale(1.1); box-shadow: 0 0 0 25px rgba(37, 99, 235, 0); }
+        100% { transform: scale(0.95); box-shadow: 0 0 0 0 rgba(37, 99, 235, 0); }
+    }
+
+    /* Styling Indikator Menunggu Orderan Driver */
+    .driver-waiting-pulse {
+        display: none;
+        align-items: center;
+        gap: 12px;
+        background: #EFF6FF;
+        border: 1.5px solid #BFDBFE;
+        padding: 14px 18px;
+        border-radius: 14px;
+        margin-top: 15px;
+        animation: fadeIn 0.3s ease;
+    }
+    .pulse-dot {
+        width: 14px;
+        height: 14px;
+        background: var(--success);
+        border-radius: 50%;
+        box-shadow: 0 0 0 0 rgba(16, 185, 129, 0.5);
+        animation: driverPulseDot 1.5s infinite;
+    }
+    @keyframes driverPulseDot {
+        0% { transform: scale(0.95); box-shadow: 0 0 0 0 rgba(16, 185, 129, 0.6); }
+        70% { transform: scale(1.15); box-shadow: 0 0 0 10px rgba(16, 185, 129, 0); }
+        100% { transform: scale(0.95); box-shadow: 0 0 0 0 rgba(16, 185, 129, 0); }
+    }
+</style>
+
+<!-- Elemen UI Modal Animasi Pencarian Penumpang -->
+<div id="modal-searching" class="modal">
+    <div class="modal-content" style="text-align: center; border-radius: 28px 28px 0 0; padding: 35px 24px;">
+        <div class="radar-container">
+            <div class="radar-circle">
+                <i class="fa-solid fa-radar"></i>
+            </div>
+            <h3 style="color: var(--primary); font-size: 18px; margin-bottom: 6px;">Mencari Driver Terdekat</h3>
+            <p style="font-size: 13px; color: var(--text-light); margin-bottom: 25px;">Sistem sedang mencocokkan koordinat GPS driver di kawasan Anda...</p>
+            
+            <button class="btn btn-danger" onclick="cancelSearchOrder()" style="background: var(--danger); max-width: 280px; margin: 0 auto;">
+                <i class="fa-solid fa-ban"></i> Batalkan Pencarian
+            </button>
+        </div>
+    </div>
+</div>
+
+<script>
+    /* --- INJEKSI 1: MODIFIKASI TAMPILAN PENCARIAN PENUMPANG DENGAN ANIMASI & TOMBOL BATAL --- */
+    
+    // Menyimpan referensi fungsi asli findDriver lalu membungkusnya dengan animasi pencarian
+    const originalFindDriver = window.findDriver || findDriver;
+    window.findDriver = function() {
+        const pickup = document.getElementById('order-pickup').value;
+        const dropoff = document.getElementById('order-dropoff').value;
+        const price = document.getElementById('order-price').value;
+        const type = document.getElementById('order-price').dataset.type;
+        const item = document.getElementById('order-item').value;
+
+        if(!pickup || !dropoff || !price || (type === 'delivery' && !item)) {
+            alert("Harap lengkapi seluruh detail titik jemput, tujuan, dan tawaran ongkos Anda!");
+            return;
+        }
+
+        closeModal('modal-order');
+        openModal('modal-searching'); // Munculkan pop-up animasi radar pencarian
+
+        // Jalankan fungsi pencarian sistem asli
+        originalFindDriver();
+    };
+
+    // Fungsi untuk membatalkan pencarian oleh penumpang
+    function cancelSearchOrder() {
+        if(activeOrderId) {
+            db.ref('orders/' + activeOrderId).remove(); // Hapus order dari database
+        }
+        closeModal('modal-searching');
+        clearActiveOrder();
+        showToast("Pencarian driver dibatalkan.");
+    }
+
+    // Modifikasi monitorOrder agar otomatis menutup modal searching jika sudah dapat driver atau batal
+    const originalMonitorOrder = window.monitorOrder || monitorOrder;
+    window.monitorOrder = function(orderId) {
+        originalMonitorOrder(orderId);
+        
+        db.ref('orders/' + orderId).on('value', snap => {
+            const order = snap.val();
+            if(!order || order.status !== 'searching') {
+                closeModal('modal-searching'); // Tutup animasi jika status berubah (diterima / batal)
+            }
+        });
+    };
+
+
+    /* --- INJEKSI 2: INDIKATOR ANIMASI MENUNGGU ORDERAN UNTUK DRIVER --- */
+    
+    // Menyisipkan elemen indikator animasi di bawah kontainer toggle driver secara otomatis saat halaman dimuat
+    document.addEventListener("DOMContentLoaded", () => {
+        const toggleContainer = document.querySelector('.toggle-container');
+        if(toggleContainer && !document.getElementById('driver-pulse-indicator')) {
+            const pulseHTML = `
+                <div id="driver-pulse-indicator" class="driver-waiting-pulse">
+                    <div class="pulse-dot"></div>
+                    <div>
+                        <h4 style="margin: 0; font-size: 13.5px; color: var(--primary);">Sedang Menunggu Orderan...</h4>
+                        <p style="margin: 0; font-size: 11.5px; color: var(--text-light);">Radar GPS aktif memindai penumpang di Nagari Surian.</p>
+                    </div>
+                </div>
+            `;
+            toggleContainer.insertAdjacentHTML('afterend', pulseHTML);
+        }
+    });
+
+    // Menghubungkan animasi status menunggu dengan status toggle driver
+    const originalToggleDriverStatus = window.toggleDriverStatus || toggleDriverStatus;
+    window.toggleDriverStatus = function(checkbox) {
+        originalToggleDriverStatus(checkbox);
+        const pulseIndicator = document.getElementById('driver-pulse-indicator');
+        if(pulseIndicator) {
+            if(checkbox.checked) {
+                pulseIndicator.style.display = 'flex';
+            } else {
+                pulseIndicator.style.display = 'none';
+            }
+        }
+    };
+</script>
+
+
+
+  
+</body>
+</html>
+
